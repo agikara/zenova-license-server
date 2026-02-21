@@ -226,7 +226,164 @@ def admin_block(req: BlockReq, x_api_key: Optional[str] = Header(default=None)):
         if res.rowcount == 0:
             raise HTTPException(status_code=404, detail="Key not found")
     return {"ok": True, "message": "blocked"}
+from fastapi import Query  # add at top if not already
 
+# -------------------- Admin Monitoring --------------------
+
+@app.get("/admin/list")
+def admin_list(
+    x_api_key: str = Header(default=None),
+    limit: int = Query(default=200, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
+    status: str | None = Query(default=None),   # active | blocked
+    plan: str | None = Query(default=None)      # 7d | 1m | 3m | lifetime
+):
+    require_admin(x_api_key)
+
+    where = []
+    params = {"limit": limit, "offset": offset}
+
+    if status:
+        where.append("status = :status")
+        params["status"] = status.strip()
+
+    if plan:
+        where.append("plan = :plan")
+        params["plan"] = plan.strip().lower()
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    with engine.begin() as conn:
+        rows = conn.execute(text(f"""
+            SELECT license_key, plan, status, expires_at,
+                   bind_login, bind_server, product,
+                   created_at, updated_at, note
+            FROM licenses
+            {where_sql}
+            ORDER BY created_at DESC
+            LIMIT :limit OFFSET :offset
+        """), params).mappings().all()
+
+        total = conn.execute(text(f"""
+            SELECT COUNT(*) AS c
+            FROM licenses
+            {where_sql}
+        """), {k: v for k, v in params.items() if k not in ("limit", "offset")}).mappings().first()["c"]
+
+    return {"ok": True, "total": total, "count": len(rows), "limit": limit, "offset": offset, "licenses": rows}
+
+
+@app.get("/admin/active")
+def admin_active(
+    x_api_key: str = Header(default=None),
+    minutes: int | None = Query(default=None, ge=1, le=43200),  # future: last_seen window
+    limit: int = Query(default=200, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
+):
+    require_admin(x_api_key)
+
+    # Active = status active AND (expires_at is null OR expires_at >= now)
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT license_key, plan, status, expires_at,
+                   bind_login, bind_server, product,
+                   created_at, updated_at, note
+            FROM licenses
+            WHERE status='active'
+              AND (expires_at IS NULL OR expires_at >= NOW())
+            ORDER BY updated_at DESC
+            LIMIT :limit OFFSET :offset
+        """), {"limit": limit, "offset": offset}).mappings().all()
+
+        total = conn.execute(text("""
+            SELECT COUNT(*) AS c
+            FROM licenses
+            WHERE status='active'
+              AND (expires_at IS NULL OR expires_at >= NOW())
+        """)).mappings().first()["c"]
+
+    return {"ok": True, "total": total, "count": len(rows), "limit": limit, "offset": offset, "licenses": rows}
+
+
+@app.get("/admin/expired")
+def admin_expired(
+    x_api_key: str = Header(default=None),
+    limit: int = Query(default=200, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
+):
+    require_admin(x_api_key)
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT license_key, plan, status, expires_at,
+                   bind_login, bind_server, product,
+                   created_at, updated_at, note
+            FROM licenses
+            WHERE expires_at IS NOT NULL
+              AND expires_at < NOW()
+            ORDER BY expires_at DESC
+            LIMIT :limit OFFSET :offset
+        """), {"limit": limit, "offset": offset}).mappings().all()
+
+        total = conn.execute(text("""
+            SELECT COUNT(*) AS c
+            FROM licenses
+            WHERE expires_at IS NOT NULL
+              AND expires_at < NOW()
+        """)).mappings().first()["c"]
+
+    return {"ok": True, "total": total, "count": len(rows), "limit": limit, "offset": offset, "licenses": rows}
+
+
+@app.get("/admin/stats")
+def admin_stats(x_api_key: str = Header(default=None)):
+    require_admin(x_api_key)
+
+    with engine.begin() as conn:
+        total = conn.execute(text("SELECT COUNT(*) AS c FROM licenses")).mappings().first()["c"]
+
+        active = conn.execute(text("""
+            SELECT COUNT(*) AS c
+            FROM licenses
+            WHERE status='active'
+              AND (expires_at IS NULL OR expires_at >= NOW())
+        """)).mappings().first()["c"]
+
+        blocked = conn.execute(text("""
+            SELECT COUNT(*) AS c
+            FROM licenses
+            WHERE status='blocked'
+        """)).mappings().first()["c"]
+
+        expired = conn.execute(text("""
+            SELECT COUNT(*) AS c
+            FROM licenses
+            WHERE expires_at IS NOT NULL
+              AND expires_at < NOW()
+        """)).mappings().first()["c"]
+
+        plans = conn.execute(text("""
+            SELECT plan, COUNT(*) AS c
+            FROM licenses
+            GROUP BY plan
+            ORDER BY c DESC
+        """)).mappings().all()
+
+        bound = conn.execute(text("""
+            SELECT COUNT(*) AS c
+            FROM licenses
+            WHERE bind_login IS NOT NULL
+        """)).mappings().first()["c"]
+
+    return {
+        "ok": True,
+        "total_licenses": total,
+        "active_now": active,
+        "expired": expired,
+        "blocked": blocked,
+        "bound_to_account": bound,
+        "by_plan": plans
+    }
 @app.post("/admin/unblock")
 def admin_unblock(req: BlockReq, x_api_key: Optional[str] = Header(default=None)):
     require_admin(x_api_key)
@@ -276,5 +433,6 @@ def admin_extend(req: ExtendReq, x_api_key: Optional[str] = Header(default=None)
             UPDATE licenses SET expires_at=:e, updated_at=NOW()
             WHERE license_key=:k
         """), {"e": new_exp, "k": req.key.strip()})
+
 
     return {"ok": True, "message": f"extended by {add_days} days", "new_expires_at": new_exp.isoformat()}
